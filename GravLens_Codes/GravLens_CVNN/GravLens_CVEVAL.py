@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from GravLensCV_cnn import GravLensComplexCNN, ComplexConv2d, ComplexLinear, CRELU, ComplexAvgPool2d, ComplexAdaptiveAvgPool2d
+from GravLensCV_cnn import GravLensComplexCNN, ComplexConv2d, ComplexLinear, CRELU, ComplexAvgPool2d, ComplexAdaptiveAvgPool2d, ComplexBatchNorm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")

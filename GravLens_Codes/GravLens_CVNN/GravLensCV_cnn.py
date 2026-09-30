@@ -91,25 +91,118 @@ class ComplexAdaptiveAvgPool2d(nn.Module):
         return torch.complex(real, imag)
 
 
+class ComplexBatchNorm(nn.Module):
+    """Complex Batch Normalization (Trabelsi et al. 2018, "Deep Complex Networks").
+
+    Jointly whitens the real/imaginary parts per-channel using the inverse
+    square root of their 2x2 covariance matrix [[Vrr,Vri],[Vri,Vii]] (rather
+    than normalizing real/imag independently, which ignores their
+    correlation), then applies a learnable complex affine transform. This is
+    the standard fix for complex-valued networks whose activations collapse
+    toward zero (and die under ReLU) when the input magnitude is small or
+    varies a lot across examples -- exactly the failure mode diagnosed here,
+    where faint/small-theta_E lens images produced near-zero activations by
+    the second conv layer.
+
+    Set spatial=True for features after a ComplexConv2d (N,C,H,W), spatial=False
+    for features after a ComplexLinear (N,C).
+    """
+
+    def __init__(self, num_features, spatial=True, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.spatial = spatial
+        self.eps = eps
+        self.momentum = momentum
+
+        # Learnable 2x2 scale (gamma) + complex shift (beta), gamma initialized
+        # to 1/sqrt(2) on the diagonal so a fully-whitened input keeps unit variance.
+        self.gamma_rr = nn.Parameter(torch.full((num_features,), 1.0 / math.sqrt(2)))
+        self.gamma_ii = nn.Parameter(torch.full((num_features,), 1.0 / math.sqrt(2)))
+        self.gamma_ri = nn.Parameter(torch.zeros(num_features))
+        self.beta_real = nn.Parameter(torch.zeros(num_features))
+        self.beta_imag = nn.Parameter(torch.zeros(num_features))
+
+        self.register_buffer("running_mean_real", torch.zeros(num_features))
+        self.register_buffer("running_mean_imag", torch.zeros(num_features))
+        self.register_buffer("running_Vrr", torch.full((num_features,), 0.5))
+        self.register_buffer("running_Vii", torch.full((num_features,), 0.5))
+        self.register_buffer("running_Vri", torch.zeros(num_features))
+
+    def _dims_and_shape(self):
+        if self.spatial:
+            return (0, 2, 3), (1, -1, 1, 1)
+        return (0,), (1, -1)
+
+    def forward(self, x):
+        real, imag = x.real, x.imag
+        dims, shape = self._dims_and_shape()
+
+        if self.training:
+            mean_r = real.mean(dim=dims)
+            mean_i = imag.mean(dim=dims)
+            xc = real - mean_r.view(*shape)
+            yc = imag - mean_i.view(*shape)
+            Vrr = (xc ** 2).mean(dim=dims) + self.eps
+            Vii = (yc ** 2).mean(dim=dims) + self.eps
+            Vri = (xc * yc).mean(dim=dims)
+
+            with torch.no_grad():
+                self.running_mean_real.mul_(1 - self.momentum).add_(self.momentum * mean_r)
+                self.running_mean_imag.mul_(1 - self.momentum).add_(self.momentum * mean_i)
+                self.running_Vrr.mul_(1 - self.momentum).add_(self.momentum * Vrr)
+                self.running_Vii.mul_(1 - self.momentum).add_(self.momentum * Vii)
+                self.running_Vri.mul_(1 - self.momentum).add_(self.momentum * Vri)
+        else:
+            mean_r, mean_i = self.running_mean_real, self.running_mean_imag
+            Vrr, Vii, Vri = self.running_Vrr, self.running_Vii, self.running_Vri
+            xc = real - mean_r.view(*shape)
+            yc = imag - mean_i.view(*shape)
+
+        # Inverse square root of the 2x2 covariance matrix (closed form for
+        # symmetric 2x2 matrices): tau = trace, delta = det.
+        tau = Vrr + Vii
+        delta = Vrr * Vii - Vri ** 2
+        s = torch.sqrt(torch.clamp(delta, min=self.eps))
+        t = torch.sqrt(torch.clamp(tau + 2 * s, min=self.eps))
+        rst = 1.0 / (s * t)
+        Wrr = ((Vii + s) * rst).view(*shape)
+        Wii = ((Vrr + s) * rst).view(*shape)
+        Wri = (-Vri * rst).view(*shape)
+
+        x_hat = Wrr * xc + Wri * yc
+        y_hat = Wri * xc + Wii * yc
+
+        gamma_rr = self.gamma_rr.view(*shape)
+        gamma_ii = self.gamma_ii.view(*shape)
+        gamma_ri = self.gamma_ri.view(*shape)
+        beta_r = self.beta_real.view(*shape)
+        beta_i = self.beta_imag.view(*shape)
+
+        out_real = gamma_rr * x_hat + gamma_ri * y_hat + beta_r
+        out_imag = gamma_ri * x_hat + gamma_ii * y_hat + beta_i
+        return torch.complex(out_real, out_imag)
+
+
 ### CV-CNN regressor -- same conv/pool schedule as the RVNN counterpart,
 ### operating on the image's centered 2D FFT (genuinely complex input)
 class GravLensComplexCNN(nn.Module):
     def __init__(self, num_params=NUM_PARAMS):
         super().__init__()
         self.features = nn.Sequential(
-            ComplexConv2d(1, 16, kernel_size=3, padding=1), CRELU(), ComplexAvgPool2d(2),   # 64 -> 32
-            ComplexConv2d(16, 32, kernel_size=3, padding=1), CRELU(), ComplexAvgPool2d(2),  # 32 -> 16
-            ComplexConv2d(32, 64, kernel_size=3, padding=1), CRELU(), ComplexAvgPool2d(2),  # 16 -> 8
+            ComplexConv2d(1, 16, kernel_size=3, padding=1), ComplexBatchNorm(16, spatial=True), CRELU(), ComplexAvgPool2d(2),   # 64 -> 32
+            ComplexConv2d(16, 32, kernel_size=3, padding=1), ComplexBatchNorm(32, spatial=True), CRELU(), ComplexAvgPool2d(2),  # 32 -> 16
+            ComplexConv2d(32, 64, kernel_size=3, padding=1), ComplexBatchNorm(64, spatial=True), CRELU(), ComplexAvgPool2d(2),  # 16 -> 8
         )
         self.pool = ComplexAdaptiveAvgPool2d(1)
         self.fc1 = ComplexLinear(64, 64)
+        self.bn_fc1 = ComplexBatchNorm(64, spatial=False)
         self.act = CRELU()
         self.fc2 = ComplexLinear(64, num_params)
 
     def forward(self, x):
         x = self.features(x)
         x = self.pool(x).flatten(1)
-        x = self.act(self.fc1(x))
+        x = self.act(self.bn_fc1(self.fc1(x)))
         x = self.fc2(x)
         return torch.sigmoid(x.abs())  # magnitude of final complex output -> [0,1] normalized targets
 
@@ -203,5 +296,5 @@ if __name__ == "__main__":
         best_vloss = float("inf")
     print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
 
-    train_model(model, train_X, train_y, val_X, val_y, epochs=400, lr=0.001,
+    train_model(model, train_X, train_y, val_X, val_y, epochs=210, lr=0.001,
                 save_dir=SAVE_DIR, start_epoch=start_epoch, best_vloss=best_vloss)
