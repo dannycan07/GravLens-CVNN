@@ -116,4 +116,4 @@ if __name__ == "__main__":
     model = GravLensRealCNN()
     print("Model has", sum(p.numel() for p in model.parameters() if p.requires_grad), "trainable parameters.")
 
-    train_model(model, train_X, train_y, val_X, val_y, epochs=200, lr=0.001)
+    train_model(model, train_X, train_y, val_X, val_y, epochs=300, lr=0.001)
